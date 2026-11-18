@@ -106,7 +106,7 @@ jobs:
           $draft=gh api "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID" | ConvertFrom-Json
           if(!$draft.draft){throw 'Release is no longer private'}
           $files=Get-ChildItem "$env:RUNNER_TEMP/release" -File
-          foreach($file in $files){if($file.Name -notmatch '^ReDesk-[0-9.]+-(windows|linux)-amd64\.(msi|zip|deb|tar\.gz)$|^(windows|linux)-(native\.json|home\.png|login\.png|settings\.png)$'){throw 'Unexpected build output'}}
+          foreach($file in $files){if($file.Name -notmatch '^ReDesk-[0-9.]+-(windows|linux)-amd64\.(msi|zip|deb|tar\.gz)$|^(windows|linux)-native\.json$'){throw 'Unexpected build output'}}
           $paths=@($files | ForEach-Object FullName)
           gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY @paths --clobber
           if($LASTEXITCODE -ne 0){throw 'Installer upload failed'}
@@ -141,7 +141,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" > "$RUNNER_TEMP/assets.json"
           node <<'NODE'
           const fs=require('node:fs');const assets=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+'/assets.json'));const version=process.env.TAG.slice(1);
-          const required=[`ReDesk-${version}-windows-amd64.msi`,`ReDesk-${version}-windows-amd64.zip`,`ReDesk-${version}-linux-amd64.deb`,`ReDesk-${version}-linux-amd64.tar.gz`,...['windows','linux'].flatMap(p=>[`${p}-native.json`,`${p}-home.png`,`${p}-login.png`,`${p}-settings.png`])];
+          const required=[`ReDesk-${version}-windows-amd64.msi`,`ReDesk-${version}-windows-amd64.zip`,`ReDesk-${version}-linux-amd64.deb`,`ReDesk-${version}-linux-amd64.tar.gz`,'windows-native.json','linux-native.json'];
           if(assets.length!==required.length||assets.some(a=>!required.includes(a.name))||required.some(name=>!assets.some(a=>a.name===name)))throw Error('Unexpected or missing release assets');
           fs.writeFileSync(process.env.RUNNER_TEMP+'/build-info.json',JSON.stringify({applicationId:'zks.rekaze.redesk',version},null,2)+'\n');
           NODE
