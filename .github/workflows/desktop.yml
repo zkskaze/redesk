@@ -1,0 +1,152 @@
+name: Build ReDesk
+run-name: Desktop ${{ inputs.tag }}
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        description: Release tag
+      release_id:
+        required: true
+        description: Unpublished draft release
+      context_secret:
+        required: true
+        description: Temporary AES-GCM key secret name
+      sha256:
+        required: true
+        description: Plain archive SHA-256
+permissions:
+  contents: write
+concurrency:
+  group: redesk-release
+  cancel-in-progress: false
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  TAG: ${{ inputs.tag }}
+  RELEASE_ID: ${{ inputs.release_id }}
+  EXPECTED_SHA256: ${{ inputs.sha256 }}
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Validate and decrypt temporary source
+        env:
+          CONTEXT_KEY: ${{ secrets[inputs.context_secret] }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if($env:TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:RELEASE_ID -notmatch '^\d+$' -or $env:EXPECTED_SHA256 -notmatch '^[a-f0-9]{64}$'){throw 'Invalid inputs'}
+          $draft=gh api "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID" | ConvertFrom-Json
+          if(!$draft.draft -or $draft.tag_name -ne $env:TAG){throw 'Release must remain a draft'}
+          @'
+          const fs=require('node:fs'),cp=require('node:child_process'),crypto=require('node:crypto'),path=require('node:path');
+          const repo=process.env.GITHUB_REPOSITORY,release=process.env.RELEASE_ID;
+          const assets=JSON.parse(cp.execFileSync('gh',['api',`repos/${repo}/releases/${release}/assets`],{encoding:'utf8'}));
+          const asset=assets.find(a=>a.name==='desktop-context.enc');if(!asset)throw Error('Missing encrypted context');
+          const encrypted=cp.execFileSync('gh',['api',`repos/${repo}/releases/assets/${asset.id}`,'-H','Accept: application/octet-stream'],{maxBuffer:64*1024*1024});
+          const key=Buffer.from(process.env.CONTEXT_KEY.trim(),'base64');if(key.length!==32||encrypted.length<29)throw Error('Invalid encrypted context');
+          const decipher=crypto.createDecipheriv('aes-256-gcm',key,encrypted.subarray(0,12));decipher.setAuthTag(encrypted.subarray(12,28));
+          const plain=Buffer.concat([decipher.update(encrypted.subarray(28)),decipher.final()]);key.fill(0);
+          if(crypto.createHash('sha256').update(plain).digest('hex')!==process.env.EXPECTED_SHA256)throw Error('Context checksum mismatch');
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP,'context.tar.gz'),plain,{mode:0o600});
+          '@ | node
+          if($LASTEXITCODE -ne 0){throw 'Decryption failed'}
+          @'
+          import os,pathlib,tarfile
+          target=pathlib.Path(os.environ['RUNNER_TEMP'])/'context'
+          target.mkdir()
+          with tarfile.open(target.parent/'context.tar.gz') as archive:
+              for member in archive.getmembers():
+                  path=pathlib.PurePosixPath(member.name)
+                  if path.is_absolute() or '..' in path.parts or '\\' in member.name or ':' in member.name or not (member.isfile() or member.isdir()):
+                      raise RuntimeError('Unsafe archive member')
+              archive.extractall(target,filter='data')
+          '@ | python
+          if($LASTEXITCODE -ne 0){throw 'Extraction failed'}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Linux desktop and video dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgtk-4-dev libwebkitgtk-6.0-dev libsecret-1-dev libayatana-appindicator3-dev libxkbcommon-dev libx11-dev pkg-config xvfb dbus-x11 dunst ffmpeg gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+      - name: Install Windows video test tools
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress --limit-output
+      - name: Build, verify player and package application
+        env:
+          CI: 'true'
+        run: |
+          $ErrorActionPreference='Stop'
+          Set-Location "$env:RUNNER_TEMP/context"
+          & pwsh -NoProfile -File ci/build.ps1 *> "$env:RUNNER_TEMP/build.log"
+          if($LASTEXITCODE -ne 0){
+            Get-Content "$env:RUNNER_TEMP/build.log" | Where-Object {$_ -match 'Error:|error [A-Z]|failed|not found|cannot|undefined|FAIL|Timed out|Expected:|Received:|error TS|error WI[XN]|error [A-Z]+[0-9]'} | Select-Object -First 70
+            throw 'Build verification failed; full source logs remain private on the temporary runner.'
+          }
+          Write-Output 'Compilation, Go tests, UI navigation, chapter pagination, video playback and native startup passed.'
+      - name: Upload verified installers to unpublished draft
+        run: |
+          $draft=gh api "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID" | ConvertFrom-Json
+          if(!$draft.draft){throw 'Release is no longer private'}
+          $files=Get-ChildItem "$env:RUNNER_TEMP/release" -File
+          foreach($file in $files){if($file.Name -notmatch '^ReDesk-[0-9.]+-(windows|linux)-amd64\.(msi|zip|deb|tar\.gz)$|^(windows|linux)-(native\.json|home\.png|login\.png|settings\.png)$'){throw 'Unexpected build output'}}
+          $paths=@($files | ForEach-Object FullName)
+          gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY @paths --clobber
+          if($LASTEXITCODE -ne 0){throw 'Installer upload failed'}
+      - name: Remove plaintext build context
+        if: always()
+        run: |
+          $root=[IO.Path]::GetFullPath($env:RUNNER_TEMP)+[IO.Path]::DirectorySeparatorChar
+          foreach($name in @('context','context.tar.gz','build.log')){
+            $target=[IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP $name))
+            if(!$target.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'Unsafe cleanup target'}
+            if(Test-Path -LiteralPath $target){Remove-Item -LiteralPath $target -Recurse -Force}
+          }
+  publish:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove encrypted context before any publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --jq '.[] | select(.name == "desktop-context.enc") | .id')
+          if [[ -n "$asset_id" ]]; then gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"; fi
+      - name: Verify exact output list and publish
+        if: needs.build.result == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" | jq -e --arg tag "$TAG" '.draft == true and .tag_name == $tag' >/dev/null
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" > "$RUNNER_TEMP/assets.json"
+          node <<'NODE'
+          const fs=require('node:fs');const assets=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+'/assets.json'));const version=process.env.TAG.slice(1);
+          const required=[`ReDesk-${version}-windows-amd64.msi`,`ReDesk-${version}-windows-amd64.zip`,`ReDesk-${version}-linux-amd64.deb`,`ReDesk-${version}-linux-amd64.tar.gz`,...['windows','linux'].flatMap(p=>[`${p}-native.json`,`${p}-home.png`,`${p}-login.png`,`${p}-settings.png`])];
+          if(assets.length!==required.length||assets.some(a=>!required.includes(a.name))||required.some(name=>!assets.some(a=>a.name===name)))throw Error('Unexpected or missing release assets');
+          fs.writeFileSync(process.env.RUNNER_TEMP+'/build-info.json',JSON.stringify({applicationId:'zks.rekaze.redesk',version},null,2)+'\n');
+          NODE
+          mkdir "$RUNNER_TEMP/downloads"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/downloads" --pattern '*.msi' --pattern '*.zip' --pattern '*.deb' --pattern '*.tar.gz'
+          (cd "$RUNNER_TEMP/downloads" && sha256sum *) > "$RUNNER_TEMP/checksums.txt"
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP/build-info.json" "$RUNNER_TEMP/checksums.txt"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest --title "ReDesk ${TAG#v}"
