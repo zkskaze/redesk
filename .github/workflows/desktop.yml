@@ -150,3 +150,42 @@ jobs:
           (cd "$RUNNER_TEMP/downloads" && sha256sum *) > "$RUNNER_TEMP/checksums.txt"
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP/build-info.json" "$RUNNER_TEMP/checksums.txt"
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest --title "ReDesk ${TAG#v}"
+
+  notify:
+    needs: [build, publish]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 2
+    steps:
+      - name: Send Gotify build result
+        continue-on-error: true
+        shell: bash
+        env:
+          GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
+          GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GOTIFY_URL" || -z "$GOTIFY_TOKEN" ]]; then
+            echo 'Gotify is not configured.'
+            exit 0
+          fi
+
+          case "$BUILD_RESULT/$PUBLISH_RESULT" in
+            success/success) outcome='успешно објављен'; priority=4 ;;
+            *cancelled*) outcome='градња је отказана'; priority=5 ;;
+            *) outcome='градња није успела'; priority=5 ;;
+          esac
+          title="ReDesk $TAG · $outcome"
+          response="$RUNNER_TEMP/gotify-response.json"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            --header "X-Gotify-Key: $GOTIFY_TOKEN" \
+            --data-urlencode "title=$title" \
+            --data-urlencode "message=$RUN_URL" \
+            --data-urlencode "priority=$priority" \
+            --output "$response" "${GOTIFY_URL%/}/message"
+          jq -e --arg title "$title" '(.id | type == "number") and .title == $title' "$response" >/dev/null
+          echo 'Gotify accepted the notification.'
