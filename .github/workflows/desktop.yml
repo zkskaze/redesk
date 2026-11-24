@@ -159,6 +159,7 @@ jobs:
     timeout-minutes: 2
     steps:
       - name: Send Gotify build result
+        id: gotify
         continue-on-error: true
         shell: bash
         env:
@@ -186,6 +187,10 @@ jobs:
             --data-urlencode "title=$title" \
             --data-urlencode "message=$RUN_URL" \
             --data-urlencode "priority=$priority" \
+            --write-out 'Gotify HTTP %{http_code} (%{content_type})\n' \
             --output "$response" "${GOTIFY_URL%/}/message"
           jq -e --arg title "$title" '(.id | type == "number") and .title == $title' "$response" >/dev/null
-          echo 'Gotify accepted the notification.'
+          echo 'sent=true' >> "$GITHUB_OUTPUT"
+      - name: Confirm Gotify delivery
+        if: steps.gotify.outputs.sent == 'true'
+        run: echo 'Gotify accepted the notification.'
